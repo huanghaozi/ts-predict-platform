@@ -90,12 +90,31 @@ class UnifiedForecastEngine:
         # Note: self.series_info might be overwritten if called multiple times, but OK for sequential runs
         local_series_info = [] 
 
+        skipped_count = 0
+        total_count = 0
         for name, group in groups:
+            total_count += 1
             group = group.sort_values(time_col)
             target = group[target_col].values
             
+            # 检查数据长度是否足够
+            context_length = int(self.params.get('context_length', 24))
+            min_required = prediction_length + context_length
+            if mode == 'backtest':
+                # 回测需要额外的 prediction_length 用于评估
+                min_required = 2 * prediction_length + context_length
+            
+            if len(target) < min_required:
+                skipped_count += 1
+                if skipped_count <= 5:  # 只显示前5个警告
+                    self.log(f"⚠️  跳过序列 '{name}': 长度 {len(target)} < 最小要求 {min_required}")
+                continue
+            
             # Backtest: truncate target
             if mode == 'backtest':
+                if len(target) <= prediction_length:
+                    skipped_count += 1
+                    continue
                 target = target[:-prediction_length]
 
             start = group[time_col].iloc[0]
@@ -151,6 +170,9 @@ class UnifiedForecastEngine:
                 "group_vals": name 
             })
         
+        if skipped_count > 0:
+            self.log(f"Warning: Skipped {skipped_count} series in {mode} mode due to length <= prediction_length ({prediction_length}).")
+
         # Update global series info only if relevant (e.g. training phase)
         if mode == 'train':
             self.series_info = local_series_info
@@ -196,12 +218,16 @@ class UnifiedForecastEngine:
         forecasts_eval = list(forecast_it)
         tss_eval = list(ts_it)
         
-        evaluator = Evaluator(quantiles=[0.1, 0.5, 0.9])
-        agg_metrics, _ = evaluator(tss_eval, forecasts_eval)
-        
-        # Rename metrics to include model name
-        model_metrics = {f"DeepAR:{k}": v for k, v in agg_metrics.items()}
-        self.log(f"DeepAR 评估完成: RMSE={agg_metrics['RMSE']:.4f}")
+        if not forecasts_eval:
+            self.log("DeepAR Evaluation: No forecasts generated (data might be too short for backtest). Skipping metrics.")
+            model_metrics = {}
+        else:
+            evaluator = Evaluator(quantiles=[0.1, 0.5, 0.9])
+            agg_metrics, _ = evaluator(tss_eval, forecasts_eval)
+            
+            # Rename metrics to include model name
+            model_metrics = {f"DeepAR:{k}": v for k, v in agg_metrics.items()}
+            self.log(f"DeepAR 评估完成: RMSE={agg_metrics['RMSE']:.4f}")
 
         # 3. Future Prediction
         self.log("DeepAR: 开始未来预测...")
