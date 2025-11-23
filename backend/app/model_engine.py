@@ -45,6 +45,92 @@ class UnifiedForecastEngine:
         df[time_col] = pd.to_datetime(df[time_col])
         return df
 
+    def fill_missing_periods(self, df):
+        """
+        填充缺失的时间周期，将缺失值填充为0
+        适用于发货量、销售量等场景
+        """
+        group_cols = self.mapping.get('group_cols', [])
+        target_col = self.mapping['target_col']
+        time_col = self.mapping['time_col']
+        freq = self.params.get('freq', 'M')
+        
+        if not group_cols:
+            # 无分组：直接对整个时间序列填充
+            df = df.sort_values(time_col)
+            
+            # 创建完整的时间范围
+            full_date_range = pd.date_range(
+                start=df[time_col].min(),
+                end=df[time_col].max(),
+                freq=freq
+            )
+            
+            # 创建完整的数据框
+            full_df = pd.DataFrame({time_col: full_date_range})
+            
+            # 合并并填充
+            result = full_df.merge(df, on=time_col, how='left')
+            result[target_col] = result[target_col].fillna(0)
+            
+            # 填充其他列（静态特征用前向填充，动态特征用0）
+            static_cols = self.mapping.get('static_cat_cols', [])
+            dynamic_cols = self.mapping.get('dynamic_real_cols', [])
+            
+            for col in static_cols:
+                if col in result.columns:
+                    result[col] = result[col].fillna(method='ffill').fillna(method='bfill')
+            
+            for col in dynamic_cols:
+                if col in result.columns:
+                    result[col] = result[col].fillna(0)
+            
+            return result
+        else:
+            # 有分组：对每个组分别填充
+            all_groups = []
+            
+            for name, group in df.groupby(group_cols):
+                group = group.sort_values(time_col)
+                
+                # 创建该组的完整时间范围
+                full_date_range = pd.date_range(
+                    start=group[time_col].min(),
+                    end=group[time_col].max(),
+                    freq=freq
+                )
+                
+                # 创建完整的数据框
+                full_df = pd.DataFrame({time_col: full_date_range})
+                
+                # 添加分组列
+                if isinstance(name, tuple):
+                    for i, col in enumerate(group_cols):
+                        full_df[col] = name[i]
+                else:
+                    full_df[group_cols[0]] = name
+                
+                # 合并并填充
+                result = full_df.merge(group, on=[time_col] + group_cols, how='left')
+                result[target_col] = result[target_col].fillna(0)
+                
+                # 填充其他列
+                static_cols = self.mapping.get('static_cat_cols', [])
+                dynamic_cols = self.mapping.get('dynamic_real_cols', [])
+                
+                for col in static_cols:
+                    if col in result.columns and col not in group_cols:
+                        result[col] = result[col].fillna(method='ffill').fillna(method='bfill')
+                
+                for col in dynamic_cols:
+                    if col in result.columns:
+                        result[col] = result[col].fillna(0)
+                
+                all_groups.append(result)
+            
+            return pd.concat(all_groups, ignore_index=True)
+
+
     def prepare_dataset_gluonts(self, df, freq='M', mode='train'):
         # mode: 'train', 'future', 'backtest'
         group_cols = self.mapping.get('group_cols', [])
@@ -92,6 +178,11 @@ class UnifiedForecastEngine:
 
         skipped_count = 0
         total_count = 0
+        filled_count = 0
+        
+        # 获取缺失数据处理策略
+        missing_strategy = self.params.get('missing_data_strategy', 'skip')
+        
         for name, group in groups:
             total_count += 1
             group = group.sort_values(time_col)
@@ -104,20 +195,50 @@ class UnifiedForecastEngine:
                 # 回测需要额外的 prediction_length 用于评估
                 min_required = 2 * prediction_length + context_length
             
+            # 长度检查和处理
             if len(target) < min_required:
-                skipped_count += 1
-                if skipped_count <= 5:  # 只显示前5个警告
-                    self.log(f"⚠️  跳过序列 '{name}': 长度 {len(target)} < 最小要求 {min_required}")
-                continue
+                if missing_strategy == 'fill_zero':
+                    # 策略：填充0到最小要求长度
+                    filled_count += 1
+                    shortage = min_required - len(target)
+                    
+                    if filled_count <= 3:  # 只显示前3个填充警告
+                        self.log(f"📝 填充序列 '{name}': 原长度 {len(target)}, 填充 {shortage} 个0")
+                    
+                    # 在前面填充0（假设缺失的是早期数据）
+                    target = np.concatenate([np.zeros(shortage), target])
+                    
+                    # 同时需要扩展时间索引
+                    start = group[time_col].iloc[0]
+                    # 计算填充后的新起始时间
+                    if freq == 'M':
+                        freq_pd = 'MS'
+                    else:
+                        freq_pd = freq
+                    new_start = pd.date_range(end=start, periods=shortage + 1, freq=freq_pd)[0]
+                    start = new_start
+                    
+                    # 动态特征也需要填充
+                    if dynamic_real_cols:
+                        original_feat = group[dynamic_real_cols].values.T.astype(np.float32)
+                        padded_feat = np.zeros((original_feat.shape[0], shortage), dtype=np.float32)
+                        group_feat_dynamic = np.concatenate([padded_feat, original_feat], axis=1)
+                    
+                else:
+                    # 策略：跳过
+                    skipped_count += 1
+                    if skipped_count <= 5:  # 只显示前5个警告
+                        self.log(f"⚠️  跳过序列 '{name}': 长度 {len(target)} < 最小要求 {min_required}")
+                    continue
+            else:
+                # 长度足够，正常处理
+                start = group[time_col].iloc[0]
+                if dynamic_real_cols:
+                    group_feat_dynamic = group[dynamic_real_cols].values.T.astype(np.float32)
             
             # Backtest: truncate target
             if mode == 'backtest':
-                if len(target) <= prediction_length:
-                    skipped_count += 1
-                    continue
                 target = target[:-prediction_length]
-
-            start = group[time_col].iloc[0]
             
             if isinstance(start, pd.Timestamp):
                 start = pd.Period(start, freq)
@@ -146,20 +267,22 @@ class UnifiedForecastEngine:
 
             # 注入动态特征
             if dynamic_real_cols:
-                # 1. 获取历史部分 (shape: num_features x history_length)
-                feat_dynamic_hist = group[dynamic_real_cols].values.T.astype(np.float32)
+                # 使用前面准备的 group_feat_dynamic，如果不存在则现在读取
+                if 'group_feat_dynamic' not in locals():
+                    group_feat_dynamic = group[dynamic_real_cols].values.T.astype(np.float32)
                 
                 if mode == 'future':
                     # 2. 构造未来部分 (简单方案: 用最后一个值向前填充)
-                    last_values = feat_dynamic_hist[:, -1].reshape(-1, 1)
+                    last_values = group_feat_dynamic[:, -1].reshape(-1, 1)
                     feat_dynamic_future = np.repeat(last_values, prediction_length, axis=1)
                     
                     # 3. 拼接
-                    feat_dynamic = np.concatenate([feat_dynamic_hist, feat_dynamic_future], axis=1)
+                    feat_dynamic = np.concatenate([group_feat_dynamic, feat_dynamic_future], axis=1)
                 elif mode == 'backtest':
-                    feat_dynamic = feat_dynamic_hist
+                    # 回测模式：动态特征也需要截断
+                    feat_dynamic = group_feat_dynamic[:, :-prediction_length]
                 else: # train
-                    feat_dynamic = feat_dynamic_hist
+                    feat_dynamic = group_feat_dynamic
                     
                 data_entry[FieldName.FEAT_DYNAMIC_REAL] = feat_dynamic
 
@@ -170,8 +293,18 @@ class UnifiedForecastEngine:
                 "group_vals": name 
             })
         
-        if skipped_count > 0:
-            self.log(f"Warning: Skipped {skipped_count} series in {mode} mode due to length <= prediction_length ({prediction_length}).")
+        # 输出统计信息
+        if skipped_count > 0 or filled_count > 0:
+            parts = [f"{mode.upper()} 数据统计: 总序列 {total_count}, 有效 {len(data_list)}"]
+            if skipped_count > 0:
+                parts.append(f"跳过 {skipped_count}")
+            if filled_count > 0:
+                parts.append(f"填充 {filled_count}")
+            self.log(f"📊 {', '.join(parts)}")
+        
+        # 确保至少有一些有效序列
+        if len(data_list) == 0:
+            raise ValueError(f"所有时间序列都被过滤掉了！模式: {mode}, 最小长度要求: {min_required} 个时间点")
 
         # Update global series info only if relevant (e.g. training phase)
         if mode == 'train':

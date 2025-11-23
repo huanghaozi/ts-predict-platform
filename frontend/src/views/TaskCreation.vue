@@ -105,6 +105,19 @@
            <span class="help-text">模型输入参考的历史长度</span>
         </el-form-item>
         
+        <el-divider content-position="left">数据处理策略</el-divider>
+        
+        <el-form-item label="缺失数据处理">
+          <el-radio-group v-model="form.params.missing_data_strategy">
+            <el-radio label="skip">跳过短序列</el-radio>
+            <el-radio label="fill_zero">缺失填充为0</el-radio>
+          </el-radio-group>
+          <div class="help-text" style="margin-top: 5px;">
+            <div>• 跳过短序列：数据长度不足时跳过该序列</div>
+            <div>• 缺失填充为0：适用于发货量、销售量等场景，没有数据视为0</div>
+          </div>
+        </el-form-item>
+        
         <el-divider content-position="left">调度配置</el-divider>
         
         <el-form-item label="Cron 表达式">
@@ -163,7 +176,8 @@ export default defineComponent({
           prediction_length: 12,
           freq: 'M',
           context_length: 24,
-          epochs: 10
+          epochs: 10,
+          missing_data_strategy: 'skip'
         }
       }
     }
