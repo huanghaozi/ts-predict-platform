@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+pandas
+numpy
+python-multipart
+sqlalchemy
+openpyxl
+gluonts
+torch
+scikit-learn
+tqdm
+matplotlib
+apscheduler
+statsforecast
